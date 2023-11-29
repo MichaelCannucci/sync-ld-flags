@@ -1,79 +1,14 @@
 const DEFAULT_HOST = 'https://app.launchdarkly.com';
 
 const jsonPatch = require('fast-json-patch');
-const request = require('request');
+const axios = require('axios');
 const program = require('commander');
+
+let client = null;
 
 // Use to calculate changing flags
 let flagsWithChanges = 0;
 let flagsWithoutChanges = 0;
-
-function patchFlag(patch, key, config, cb) {
-  const { baseUrl, projectKey, apiToken } = config;
-  const requestOptions = {
-    url: `${baseUrl}/flags/${projectKey}/${key}`,
-    body: patch,
-    headers: {
-      Authorization: apiToken,
-      'Content-Type': 'application/json',
-    },
-  };
-
-  return new Promise(function (resolve) {
-    request.patch(requestOptions, function (error, response, body) {
-      cb(error, response, body);
-      resolve(true);
-    });
-  });
-}
-
-const fetchFlags = function (config, cb) {
-  const { baseUrl, projectKey, sourceEnvironment, destinationEnvironment, apiToken, tags, flag } = config;
-  let isSingle = flag && !tags;
-  let url = `${baseUrl}/flags/${projectKey}`;
-
-  if (isSingle) {
-    url += `/${flag}`;
-  }
-
-  url += `?summary=0&env=${sourceEnvironment}&env=${destinationEnvironment}`;
-
-  if (tags) {
-    url += '&filter=tags:' + tags.join('+');
-  }
-
-  const requestOptions = {
-    url,
-    headers: {
-      Authorization: apiToken,
-      'Content-Type': 'application/json',
-    },
-  };
-
-  function callback(error, response, body) {
-    if (error) {
-      return cb(error);
-    }
-
-    if (response.statusCode === 200) {
-      const parsed = JSON.parse(body);
-      return cb(null, isSingle ? [parsed] : parsed.items);
-    }
-
-    if (response.statusCode === 404) {
-      return cb({ message: `Unknown flag key: ${flag}` });
-    }
-
-    try {
-      const parsed = JSON.parse(body);
-      return cb(parsed);
-    } catch (err) {
-      cb({ message: 'Unknown error', response: response.toJSON() });
-    }
-  }
-
-  request(requestOptions, callback);
-};
 
 const copyValues = function (flag, config) {
   const { destinationEnvironment, sourceEnvironment } = config;
@@ -124,6 +59,43 @@ const stripSegments = function (flag) {
   }
 };
 
+const fetchFlags = async function (config) {
+  const { baseUrl, projectKey, sourceEnvironment, destinationEnvironment, tags, flag } = config;
+  let isSingle = flag && !tags;
+  let url = `${baseUrl}/flags/${projectKey}`;
+
+  if (isSingle) {
+    url += `/${flag}`;
+  }
+
+  url += `?summary=0&env=${sourceEnvironment}&env=${destinationEnvironment}`;
+
+  if (tags) {
+    url += '&filter=tags:' + tags.join('+');
+  }
+
+  try {
+    const { data } = await client({
+      method: 'GET',
+      url,
+    });
+
+    return isSingle ? [data] : data.items;
+  } catch (error) {
+    const response = error.response;
+
+    if (!response) {
+      return { message: 'Unknown error', response: error };
+    }
+
+    if (response.status === 404) {
+      return { message: `Unknown flag key: ${flag}` };
+    }
+
+    return { message: 'Unknown error', response: error.response.data };
+  }
+};
+
 async function syncFlag(flag, config = {}) {
   const { omitSegments, dryRun, verbose } = config;
   // Remove rule ids because _id is read-only and cannot be written except when reordering rules
@@ -146,16 +118,32 @@ async function syncFlag(flag, config = {}) {
       console.log(`Preview changes for ${flag.key}:\n`, diff);
       return;
     }
-    console.log(`Modifying ${flag.key} with:\n`, diff);
 
-    await patchFlag(JSON.stringify(diff), flag.key, config, function (error, response, body) {
-      if (error) {
-        throw new Error(error);
+    if (verbose) {
+      console.log(`Modifying ${flag.key} with:\n`, diff);
+    }
+    console.log(`Modifying ${flag.key}`);
+
+    const { baseUrl, projectKey } = config;
+    try {
+      await client({
+        method: 'PATCH',
+        url: `${baseUrl}/flags/${projectKey}/${flag.key}`,
+        data: JSON.stringify(diff),
+      });
+    } catch (error) {
+      const response = error.response;
+      if (!response) {
+        throw error;
       }
-      if (response.statusCode >= 400) {
-        console.error(`PATCH failed (${response.statusCode}) for flag ${flag.key}:\n`, body);
+
+      if (response.status >= 400) {
+        console.error(`PATCH failed (${response.status}) for flag ${flag.key}:\n`, response.data);
+        return;
       }
-    });
+
+      throw error;
+    }
   } else {
     flagsWithoutChanges += 1;
     if (verbose) console.log(`No changes in ${flag.key}`);
@@ -163,32 +151,31 @@ async function syncFlag(flag, config = {}) {
 }
 
 async function syncEnvironment(config = {}) {
-  fetchFlags(config, async function (err, flags) {
-    if (err) {
-      const message = err.message || '';
-      const matches = message.match(/^Unknown environment key: (?<envKey>.+)$/);
-      if (matches && matches.groups && matches.groups.envKey) {
-        const envKey = matches.groups.envKey;
-        console.error(
-          `Invalid ${
-            config.sourceEnv === envKey ? 'source' : 'destination'
-          } environment "${envKey}". Did you specify the right project?`,
-        );
-      } else {
-        console.error('Error fetching flags\n', err);
-      }
-
-      process.exit(1);
-    }
+  try {
+    const flags = await fetchFlags(config);
 
     for (const flag of flags) {
       await syncFlag(flag, config);
     }
 
     const modifiedMessage = config.dryRun ? 'To be modified' : 'Modified';
-
     console.log(`${modifiedMessage}: ${flagsWithChanges}, No changes required: ${flagsWithoutChanges}`);
-  });
+  } catch (error) {
+    const message = error.message || '';
+    const matches = message.match(/^Unknown environment key: (?<envKey>.+)$/);
+    if (matches && matches.groups && matches.groups.envKey) {
+      const envKey = matches.groups.envKey;
+      console.error(
+        `Invalid ${
+          config.sourceEnv === envKey ? 'source' : 'destination'
+        } environment "${envKey}". Did you specify the right project?`,
+      );
+    } else {
+      console.error('Error fetching flags\n', error);
+    }
+
+    process.exit(1);
+  }
 }
 
 program
@@ -263,6 +250,36 @@ if (require.main === module) {
     program.outputHelp();
     process.exit(1);
   }
+
+  client = axios.create({
+    headers: {
+      Authorization: config.apiToken,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  client.interceptors.response.use(undefined, function (error) {
+    const { response, config } = error;
+
+    if (!response) {
+      throw Promise.reject(error);
+    }
+
+    config.retryCount = config.retryCount || 0;
+    config.retryDelay = config.retryDelay || 1000;
+
+    config.retryCount += 1;
+
+    if (response.status === 429) {
+      const delay = config.retryDelay * config.retryCount ** 2;
+      console.log(`Rate limit hit. Retrying after ${delay}ms`);
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          resolve(client.request(error.config));
+        }, delay);
+      });
+    }
+  });
 
   syncEnvironment(config);
 }
